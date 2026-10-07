@@ -1500,14 +1500,24 @@ func (app *App) prepareStandardRequest(ctx context.Context, r *http.Request, bod
 	}
 	payload := app.rewriteCachedFileHints(preprocessed.Payload, authToken)
 	workspaceRoot := deriveWorkspaceRoot(payload)
-	payload = injectWorkspaceNotice(payload, workspaceRoot)
 	req := buildChatStandardRequest(payload, defaultModel, surface)
 	clientProfile := detectClientProfile(r, req.Tools)
+	// The workspace notice only matters to agentic clients that call tools. A
+	// plain chat message must not get ~1KB of path/shell instructions glued on:
+	// it is pointless and the upstream WAF inspects prompt text too.
+	agentic := clientProfile != "" || len(req.Tools) > 0
+	if agentic {
+		payload = injectWorkspaceNotice(payload, workspaceRoot)
+		req = buildChatStandardRequest(payload, defaultModel, surface)
+	}
 	prepared, err := app.prepareContextAttachments(ctx, payload, surface, authToken, clientProfile, req.Tools, preprocessed.Attachments)
 	if err != nil {
 		return StandardRequest{}, err
 	}
-	finalPayload := injectWorkspaceNotice(prepared.Payload, prepared.WorkspaceRoot)
+	finalPayload := prepared.Payload
+	if agentic {
+		finalPayload = injectWorkspaceNotice(finalPayload, prepared.WorkspaceRoot)
+	}
 	finalPayload = app.rewriteCachedFileHints(finalPayload, authToken)
 	req = buildChatStandardRequest(finalPayload, defaultModel, surface)
 	req.SessionKey = prepared.SessionKey

@@ -53,6 +53,37 @@ const (
 // challenge instead of API data.
 var errWAFChallenge = errors.New("upstream WAF captcha challenge (x5sec/punish): the request was blocked by Alibaba anti-bot")
 
+// errHeaderTimeout: the page never produced response headers (not retried: it
+// would only multiply the wait).
+var errHeaderTimeout = errors.New("browser fetch: no response headers")
+
+// wafPendingError: the WAF showed a captcha in the page and the request is
+// stuck until someone solves it. Matches errWAFChallenge with errors.Is.
+type wafPendingError struct{ detail, screenshot string }
+
+func (e *wafPendingError) Error() string {
+	msg := "upstream WAF captcha challenge is waiting to be solved in the headless browser"
+	if e.detail != "" {
+		msg += " (" + e.detail + ")"
+	}
+	if e.screenshot != "" {
+		msg += "; screenshot: " + e.screenshot
+	}
+	return msg
+}
+func (e *wafPendingError) Unwrap() error { return errWAFChallenge }
+
+// challengeProbeScript looks for the baxia/punish captcha overlay the WAF
+// injects into the page; while it is up, a hooked fetch() never resolves.
+const challengeProbeScript = `(() => {
+  const sels = ['#baxia-dialog-content', '.baxia-dialog', '[id*="baxia"]', 'iframe[src*="punish"]', 'iframe[src*="_____tmd_____"]', '#nocaptcha', '.nc-container', '#J_slider', '[class*="captcha"]', '[id*="captcha"]'];
+  for (const s of sels) {
+    const el = document.querySelector(s);
+    if (el) return JSON.stringify({sel: s, src: el.src || '', text: (el.innerText || '').slice(0, 120)});
+  }
+  return '';
+})()`
+
 // isWAFChallenge reports whether text looks like a baxia captcha/punish page.
 func isWAFChallenge(text string) bool {
 	if text == "" {
@@ -414,23 +445,88 @@ func (s *browserSession) start(ctx context.Context, id, rawURL, method string, h
 		defer t.Stop()
 		timeout = t.C
 	}
-	select {
-	case head := <-st.head:
-		if head.err != nil {
+	probe := time.NewTicker(time.Second)
+	defer probe.Stop()
+	slow := time.NewTimer(15 * time.Second)
+	defer slow.Stop()
+	for {
+		select {
+		case head := <-st.head:
+			if head.err != nil {
+				st.abort()
+				return nil, head, head.err
+			}
+			return st, head, nil
+		case <-probe.C:
+			if info := s.probeChallenge(); info != "" {
+				shot := s.snapshot("waf_challenge")
+				if l := s.engine.logger; l != nil {
+					l.Warn("WAF captcha overlay shown in the headless browser; the request is stuck until it is solved", "session", s.id, "overlay", info, "screenshot", shot)
+				}
+				st.abort()
+				return nil, browserHead{}, &wafPendingError{detail: info, screenshot: shot}
+			}
+		case <-slow.C:
+			shot := s.snapshot("slow_headers")
+			if l := s.engine.logger; l != nil {
+				l.Warn("no response headers from the upstream after 15s (still waiting)", "session", s.id, "screenshot", shot, "page", s.pageSummary())
+			}
+		case <-timeout:
 			st.abort()
-			return nil, head, head.err
+			return nil, browserHead{}, fmt.Errorf("%w within %s", errHeaderTimeout, s.engine.headerTimeout)
+		case <-ctx.Done():
+			st.abort()
+			return nil, browserHead{}, ctx.Err()
+		case <-s.ctx.Done():
+			st.abort()
+			return nil, browserHead{}, errors.New("browser session closed")
 		}
-		return st, head, nil
-	case <-timeout:
-		st.abort()
-		return nil, browserHead{}, fmt.Errorf("browser fetch: no response headers within %s", s.engine.headerTimeout)
-	case <-ctx.Done():
-		st.abort()
-		return nil, browserHead{}, ctx.Err()
-	case <-s.ctx.Done():
-		st.abort()
-		return nil, browserHead{}, errors.New("browser session closed")
 	}
+}
+
+// probeChallenge returns a description of the captcha overlay, or "".
+func (s *browserSession) probeChallenge() string {
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+	defer cancel()
+	out, err := chromedp.Run(ctx, chromedp.Evaluate[string](challengeProbeScript))
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// pageSummary is the current URL and title, for logs.
+func (s *browserSession) pageSummary() string {
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+	defer cancel()
+	out, err := chromedp.Run(ctx, chromedp.Evaluate[string](`location.href + ' | ' + document.title`))
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// snapshot saves a screenshot of the page into the diagnostics directory and
+// returns its path ("" if unavailable).
+func (s *browserSession) snapshot(reason string) string {
+	dir := s.engine.cfg.DiagDir
+	if dir == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancel()
+	png, err := chromedp.Run(ctx, chromedp.CaptureScreenshot())
+	if err != nil || len(png) == 0 {
+		return ""
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	path := filepath.Join(dir, fmt.Sprintf("browser_%s_%d.png", reason, time.Now().UnixMilli()))
+	if err := os.WriteFile(path, png, 0o644); err != nil {
+		return ""
+	}
+	return path
 }
 
 // ---------------------------------------------------------------- engine
@@ -446,6 +542,7 @@ type browserEngineConfig struct {
 	ExtraOptions  []chromedp.ExecAllocatorOption // test hook
 	UserAgent     string
 	Headless      bool
+	DiagDir       string // where browser screenshots for diagnostics are written
 }
 
 type browserEngine struct {
@@ -833,7 +930,12 @@ func (t *browserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 				return nil, ctx.Err()
 			}
 			lastErr = err
-			if sess.dead.Load() || sess.ctx.Err() != nil {
+			switch {
+			case errors.Is(err, errHeaderTimeout):
+				return nil, err // retrying only multiplies the wait
+			case errors.Is(err, errWAFChallenge):
+				t.engine.rotate(sess) // fresh cookies/fingerprint for the next attempt
+			case sess.dead.Load() || sess.ctx.Err() != nil:
 				t.engine.rotate(sess)
 			}
 			continue

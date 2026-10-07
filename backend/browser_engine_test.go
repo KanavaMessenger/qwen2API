@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -441,5 +443,103 @@ func TestJWTDiagnostics(t *testing.T) {
 	}
 	if jwtDiagnostics("abc") != "token is not a JWT" {
 		t.Fatal("non-JWT must be reported")
+	}
+}
+
+// A WAF that shows a captcha overlay and keeps fetch() pending must be reported
+// quickly with a screenshot instead of hanging (and not be retried forever).
+func TestBrowserEngineReportsPendingCaptchaOverlay(t *testing.T) {
+	path, err := findChromium(testChromiumPath)
+	if err != nil {
+		t.Skip("no chromium available")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, `<html><body><h1>mock</h1><script>
+const of = window.fetch;
+window.fetch = function (u, i) {
+  if (String(u).includes('captcha-pending')) {
+    const d = document.createElement('div'); d.id = 'baxia-dialog-content'; d.innerText = 'slide to verify';
+    document.body.appendChild(d);
+    return new Promise(() => {});
+  }
+  return of.call(this, u, i);
+};</script></body></html>`)
+	})
+	mux.HandleFunc("/api/nohead", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body) // lets the server notice the client going away
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	diag := t.TempDir()
+	eng, err := newBrowserEngine(browserEngineConfig{
+		BaseURL: srv.URL, ExecPath: path, PoolSize: 1, HeaderTimeout: 4 * time.Second,
+		WarmupDelay: 50 * time.Millisecond, Headless: true, DiagDir: diag,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(eng.Close)
+	tr := &browserTransport{engine: eng, fallback: http.DefaultTransport}
+
+	start := time.Now()
+	_, err = doReq(t, tr, http.MethodPost, srv.URL+"/api/captcha-pending", "{}")
+	var pending *wafPendingError
+	if !errors.Is(err, errWAFChallenge) || !errors.As(err, &pending) {
+		t.Fatalf("expected a pending-captcha error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "baxia-dialog-content") || pending.screenshot == "" {
+		t.Fatalf("error should name the overlay and carry a screenshot: %v", err)
+	}
+	if st, serr := os.Stat(pending.screenshot); serr != nil || st.Size() < 500 {
+		t.Fatalf("screenshot missing: %v", serr)
+	}
+	if d := time.Since(start); d > 25*time.Second {
+		t.Fatalf("took too long: %s", d)
+	}
+
+	// No headers and no overlay: one attempt only (timeout 4s), plus a screenshot is not required.
+	start = time.Now()
+	_, err = doReq(t, tr, http.MethodPost, srv.URL+"/api/nohead", "{}")
+	if !errors.Is(err, errHeaderTimeout) {
+		t.Fatalf("expected errHeaderTimeout, got %v", err)
+	}
+	if d := time.Since(start); d > 9*time.Second {
+		t.Fatalf("header timeout must not be retried, took %s", d)
+	}
+}
+
+func TestWorkspaceNoticeOnlyForAgenticRequests(t *testing.T) {
+	app := &App{settings: Settings{}, fileContentCache: newFileContentCache()}
+	app.uploadedFileStore = NewJSONStore(filepath.Join(t.TempDir(), "u.json"), []any{})
+	app.contextCacheStore = NewJSONStore(filepath.Join(t.TempDir(), "c.json"), []any{})
+	app.sessionStore = NewJSONStore(filepath.Join(t.TempDir(), "s.json"), []any{})
+	plain := map[string]any{"model": "qwen3.6-plus", "messages": []any{map[string]any{"role": "user", "content": "Hi"}}}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("User-Agent", "Mozilla/5.0 Firefox/157.0")
+	req, err := app.prepareStandardRequest(context.Background(), r, plain, "qwen3.6-plus", "openai", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(req.Prompt, "WORKSPACE CONTEXT") || strings.Contains(req.Prompt, "/workspace") {
+		t.Fatalf("plain chat must not get the workspace notice: %q", req.Prompt)
+	}
+
+	agentic := map[string]any{"model": "qwen3.6-plus",
+		"messages": []any{map[string]any{"role": "user", "content": "Hi"}},
+		"tools":    []any{map[string]any{"type": "function", "function": map[string]any{"name": "Read", "description": "read", "parameters": map[string]any{"type": "object"}}}}}
+	req, err = app.prepareStandardRequest(context.Background(), r, agentic, "qwen3.6-plus", "openai", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(req.Prompt, "WORKSPACE CONTEXT") {
+		t.Fatalf("agentic requests with tools must keep the workspace notice: %q", req.Prompt)
 	}
 }

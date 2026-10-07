@@ -7929,6 +7929,7 @@ func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *Q
 			WarmupDelay:   time.Duration(settings.BrowserWarmupMS) * time.Millisecond,
 			Proxy:         settings.BrowserProxy,
 			Headless:      settings.BrowserHeadless,
+			DiagDir:       settings.LogsDir,
 		}, logger)
 		if err != nil {
 			logger.Error("headless chromium engine unavailable, falling back to plain HTTP", "error", err)
