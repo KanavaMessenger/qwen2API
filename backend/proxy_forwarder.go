@@ -21,8 +21,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http/httpproxy"
@@ -151,6 +153,13 @@ type proxyForwarder struct {
 	transport *http.Transport
 	logger    *slog.Logger
 	once      sync.Once
+	lastErr   atomic.Value // string: last failed dial, shown in warm-up errors
+}
+
+// LastError is the most recent upstream dial failure ("host:port: error").
+func (f *proxyForwarder) LastError() string {
+	v, _ := f.lastErr.Load().(string)
+	return v
 }
 
 func startProxyForwarder(logger *slog.Logger, dial dialFunc) (*proxyForwarder, error) {
@@ -218,8 +227,9 @@ func (f *proxyForwarder) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	upstream, err := f.dial(ctx, "tcp", r.Host)
 	if err != nil {
+		f.lastErr.Store(fmt.Sprintf("%s: %v", r.Host, err))
 		if f.logger != nil {
-			f.logger.Warn("browser proxy: connect failed", "target", r.Host, "error", err)
+			f.logger.Warn("browser proxy: connect failed", "target", r.Host, "route", redactProxyURL(envProxyFor(r.Host)), "error", err)
 		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -315,4 +325,24 @@ func describeBrowserProxy(configured string, base *url.URL) string {
 		}
 	}
 	return "local forwarder -> " + redactProxyURL(envProxyFor(host))
+}
+
+// proxyEnvSummary lists the proxy-related environment variables (credentials
+// hidden) for diagnostics.
+func proxyEnvSummary() string {
+	var parts []string
+	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"} {
+		v := strings.TrimSpace(os.Getenv(name))
+		if v == "" {
+			continue
+		}
+		if u, err := url.Parse(v); err == nil && u.Host != "" {
+			v = redactProxyURL(u)
+		}
+		parts = append(parts, name+"="+v)
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, " ")
 }

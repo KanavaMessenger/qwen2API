@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -162,5 +163,26 @@ func TestBrowserEngineThroughLocalForwarder(t *testing.T) {
 				t.Fatal("traffic did not go through the local forwarder")
 			}
 		})
+	}
+}
+
+func TestForwarderReportsDialErrorInWarmupFailure(t *testing.T) {
+	if _, err := findChromium(testChromiumPath); err != nil {
+		t.Skip("no chromium available")
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	eng, err := newBrowserEngine(browserEngineConfig{
+		BaseURL: "https://qwen.test:4443", PoolSize: 1, HeaderTimeout: 10 * time.Second, Headless: true,
+		ProxyDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return nil, errors.New("dial tcp: lookup qwen.test: no such host")
+		},
+	}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(eng.Close)
+	_, err = eng.acquire()
+	if err == nil || !strings.Contains(err.Error(), "no such host") {
+		t.Fatalf("warm-up error must carry the dial reason, got: %v", err)
 	}
 }

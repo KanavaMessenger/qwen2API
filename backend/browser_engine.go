@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -616,7 +617,7 @@ func (e *browserEngine) newSession(id int) (*browserSession, error) {
 	)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("browser warm-up navigation failed: %w", err)
+		return nil, fmt.Errorf("browser warm-up navigation failed: %w%s", err, e.forwarderHint())
 	}
 	if e.cfg.WarmupDelay > 0 {
 		select {
@@ -683,8 +684,52 @@ func (e *browserEngine) rotate(s *browserSession) {
 	}
 }
 
+// forwarderHint appends the forwarder's last dial error to warm-up failures, so
+// ERR_TUNNEL_CONNECTION_FAILED comes with the real network reason.
+func (e *browserEngine) forwarderHint() string {
+	e.mu.Lock()
+	f := e.forwarder
+	e.mu.Unlock()
+	if f == nil {
+		return ""
+	}
+	if last := f.LastError(); last != "" {
+		return " [forwarder could not reach upstream: " + last + "]"
+	}
+	return ""
+}
+
+// checkNetwork dials the upstream the same way the forwarder does and logs the
+// outcome, so network/proxy problems are visible at startup.
+func (e *browserEngine) checkNetwork() {
+	if e.logger == nil || e.cfg.Proxy != "" || e.cfg.ProxyDial != nil {
+		return
+	}
+	host := e.baseURL.Host
+	if e.baseURL.Port() == "" {
+		port := "80"
+		if e.baseURL.Scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(e.baseURL.Hostname(), port)
+	}
+	route := redactProxyURL(envProxyFor(host))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	conn, err := dialViaEnvProxy(ctx, "tcp", host)
+	if err != nil {
+		e.logger.Warn("network check FAILED: cannot reach the upstream from this container; the browser will fail too. Set HTTPS_PROXY (or fix DNS/firewall) for the container",
+			"target", host, "route", route, "proxy_env", proxyEnvSummary(), "error", err)
+		return
+	}
+	conn.Close()
+	e.logger.Info("network check ok", "target", host, "route", route, "proxy_env", proxyEnvSummary(), "connect_ms", time.Since(start).Milliseconds())
+}
+
 // Prewarm starts the browser in the background so the first request is fast.
 func (e *browserEngine) Prewarm() {
+	e.checkNetwork()
 	if _, err := e.acquire(); err != nil && e.logger != nil {
 		e.logger.Warn("headless chromium prewarm failed", "error", err)
 	}
