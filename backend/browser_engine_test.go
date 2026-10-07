@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -287,5 +288,142 @@ func TestJWTExpiryUnix(t *testing.T) {
 	}
 	if jwtExpiryUnix("not-a-jwt") != 0 || jwtExpiryUnix("") != 0 {
 		t.Fatal("non-JWT must give 0")
+	}
+}
+
+func TestRandomChatTitle(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 2000; i++ {
+		title := randomChatTitle()
+		if title == "" || len(title) > 60 || strings.HasPrefix(title, "api_") {
+			t.Fatalf("bad title %q", title)
+		}
+		seen[title] = true
+	}
+	if len(seen) < 1500 {
+		t.Fatalf("titles are not random enough: %d distinct of 2000", len(seen))
+	}
+}
+
+// failingTransport makes any request that bypasses the browser fail the test.
+type failingTransport struct{ t *testing.T }
+
+func (f failingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.t.Errorf("request bypassed headless Chromium: %s %s", req.Method, req.URL)
+	return nil, errors.New("direct request not allowed")
+}
+
+func TestAllQwenClientTrafficGoesThroughChromium(t *testing.T) {
+	if _, err := findChromium(testChromiumPath); err != nil {
+		t.Skip("no chromium available")
+	}
+	var browserHits, directHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != "/favicon.ico" {
+			// Real browsers always send Fetch Metadata headers and a Chrome UA;
+			// Go's net/http sends neither.
+			if r.Header.Get("Sec-Fetch-Mode") == "cors" && strings.Contains(r.Header.Get("User-Agent"), "Chrome") && !strings.Contains(r.Header.Get("User-Agent"), "Go-http-client") {
+				browserHits.Add(1)
+			} else {
+				directHits.Add(1)
+			}
+		}
+		if strings.HasSuffix(r.URL.Path, "/completions") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"success":true,"data":{"id":"x"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	withBaseURL(t, srv.URL)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := NewQwenClient(nil, Settings{UpstreamEngine: engineBrowser, BrowserPoolSize: 1, BrowserHeadless: true, ChatDeleteRetryAttempts: 1,
+		UpstreamStreamHeaderTimeoutSeconds: 20, UpstreamStreamFirstEventTimeoutSeconds: 20, UpstreamStreamIdleTimeoutSeconds: 20}, logger)
+	defer client.Close()
+	// Anything that skips the browser transport hits this and fails the test.
+	client.http.Transport.(*browserTransport).fallback = failingTransport{t}
+
+	ctx := context.Background()
+	calls := 0
+	do := func(err error) {
+		t.Helper()
+		calls++
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := client.CreateChat(ctx, "tok", "qwen3.6-plus", "t2t")
+	do(err)
+	do(client.StreamChat(ctx, "tok", "x", map[string]any{}, func(UpstreamEvent) error { return nil }))
+	_, _, err = client.PostChatCompletionOnce(ctx, "tok", "x", map[string]any{}, 10*time.Second)
+	do(err)
+	_, _, err = client.GetChatDetail(ctx, "tok", "x", 10*time.Second)
+	do(err)
+	_, _, err = client.GetVisionTaskStatus(ctx, "tok", "x", 10*time.Second)
+	do(err)
+	_, err = client.ListChats(ctx, "tok", 5)
+	do(err)
+	if res := client.VerifyTokenDetail(ctx, "tok"); !res.Valid {
+		t.Fatalf("verify: %+v", res)
+	}
+	calls++
+	if !client.DeleteChat(ctx, "tok", "x") {
+		t.Fatal("DeleteChat failed")
+	}
+	calls++
+	if browserHits.Load() < int32(calls) || directHits.Load() != 0 {
+		t.Fatalf("browser=%d direct=%d, expected all %d calls via the browser", browserHits.Load(), directHits.Load(), calls)
+	}
+}
+
+func TestBrowserEngineCrossOriginBinaryUpload(t *testing.T) {
+	// "OSS": a different origin that needs CORS and receives binary PUT bodies.
+	var got []byte
+	var gotHdr http.Header
+	oss := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*") // wildcard => credentials must be omitted
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "PUT, GET, OPTIONS")
+		if r.Method == http.MethodOptions {
+			return
+		}
+		got, _ = io.ReadAll(r.Body)
+		gotHdr = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/xml")
+		io.WriteString(w, "<ok/>")
+	}))
+	t.Cleanup(oss.Close)
+	srv, _ := newMockUpstream(t)
+	eng := testEngine(t, srv.URL)
+	client := eng.HTTPClient(30 * time.Second)
+
+	for _, size := range []int{1000, 700 << 10} { // inline path and chunked-push path
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i*7 + 13) // includes invalid UTF-8 / NUL bytes
+		}
+		req, _ := http.NewRequest(http.MethodPut, oss.URL+"/bucket/file.bin", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("x-oss-security-token", "sts")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || string(body) != "<ok/>" {
+			t.Fatalf("size %d: status=%d body=%q", size, resp.StatusCode, body)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("size %d: binary body corrupted (got %d bytes)", size, len(got))
+		}
+		if gotHdr.Get("X-Oss-Security-Token") != "sts" || !strings.Contains(gotHdr.Get("User-Agent"), "Chrome") {
+			t.Fatalf("size %d: headers %v", size, gotHdr)
+		}
 	}
 }

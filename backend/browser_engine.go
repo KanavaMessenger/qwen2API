@@ -43,6 +43,9 @@ const (
 
 	browserBindingName = "q2aEmit"
 	browserMaxRetries  = 2
+
+	browserInlineBodyMax = 256 << 10 // bodies up to this size are sent inline
+	browserBodyChunk     = 256 << 10
 )
 
 // errWAFChallenge is returned when the upstream answers with a captcha
@@ -231,13 +234,39 @@ const fetchScript = `(() => {
   const ctrls = {};
   const emit = (o) => { try { window.` + browserBindingName + `(JSON.stringify(o)); } catch (e) {} };
   const isText = (ct) => /^(text\/|application\/(json|xml|javascript|x-ndjson))|\+json|event-stream/i.test(ct || '');
+  const bodies = {};
+  const b64ToBytes = (b64) => {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  };
   window.__q2a = {
-    abort(id) { const c = ctrls[id]; if (c) { try { c.abort(); } catch (e) {} } },
+    abort(id) { const c = ctrls[id]; if (c) { try { c.abort(); } catch (e) {} } delete bodies[id]; },
+    // Large request bodies are streamed in chunks to stay below CDP message limits.
+    push(id, b64) { (bodies[id] = bodies[id] || []).push(b64ToBytes(b64)); },
     async run(id, url, init) {
       const ctrl = new AbortController();
       ctrls[id] = ctrl;
       init.signal = ctrl.signal;
-      init.credentials = 'include';
+      let crossOrigin = false;
+      try { crossOrigin = new URL(url, location.href).origin !== location.origin; } catch (e) {}
+      // Wildcard CORS (e.g. object storage) is incompatible with credentials.
+      init.credentials = crossOrigin ? 'omit' : 'include';
+      try {
+        if (init.bodyPushed) {
+          init.body = new Blob(bodies[id] || []);
+          delete bodies[id];
+        } else if (init.bodyB64 !== undefined) {
+          init.body = b64ToBytes(init.bodyB64);
+        }
+      } catch (e) {
+        emit({id, kind: 'error', error: 'bad request body: ' + String((e && e.message) || e)});
+        delete ctrls[id];
+        return;
+      }
+      delete init.bodyPushed;
+      delete init.bodyB64;
       try {
         const resp = await fetch(url, init);
         const headers = {};
@@ -345,12 +374,29 @@ func (s *browserSession) start(ctx context.Context, id, rawURL, method string, h
 	st := &browserStream{id: id, sess: s, head: make(chan browserHead, 1), queue: newChunkQueue()}
 	s.streams.Store(id, st)
 	init := map[string]any{"method": method, "headers": headers}
-	if len(body) > 0 && method != http.MethodGet && method != http.MethodHead {
-		init["body"] = string(body)
-	}
-	initJSON, _ := json.Marshal(init)
 	idJSON, _ := json.Marshal(id)
 	urlJSON, _ := json.Marshal(rawURL)
+	if len(body) > 0 && method != http.MethodGet && method != http.MethodHead {
+		if len(body) <= browserInlineBodyMax {
+			init["bodyB64"] = base64.StdEncoding.EncodeToString(body)
+		} else {
+			// Stream big bodies (file uploads) into the page in chunks.
+			for off := 0; off < len(body); off += browserBodyChunk {
+				end := min(off+browserBodyChunk, len(body))
+				chunk := fmt.Sprintf("%s; window.__q2a.push(%s, %q); true", fetchScript, idJSON, base64.StdEncoding.EncodeToString(body[off:end]))
+				pushCtx, cancelPush := context.WithTimeout(s.ctx, 30*time.Second)
+				_, err := chromedp.Run(pushCtx, chromedp.Evaluate[chromedp.Void](chunk))
+				cancelPush()
+				if err != nil {
+					s.streams.Delete(id)
+					st.queue.shutdown()
+					return nil, browserHead{}, fmt.Errorf("browser body upload failed: %w", err)
+				}
+			}
+			init["bodyPushed"] = true
+		}
+	}
+	initJSON, _ := json.Marshal(init)
 	// Re-install the bridge on every call: it is lost if the page navigated.
 	script := fmt.Sprintf("%s; window.__q2a.run(%s, %s, %s); true", fetchScript, idJSON, urlJSON, initJSON)
 	runCtx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
@@ -678,10 +724,19 @@ func fetchHeaders(h http.Header) map[string]string {
 type browserTransport struct {
 	engine   *browserEngine
 	fallback http.RoundTripper
+	// crossOrigin sends requests to other hosts (e.g. object storage) through
+	// the page as well; the target must allow the page origin via CORS.
+	crossOrigin bool
+}
+
+// HTTPClient returns a client that executes every request through the browser,
+// including cross-origin hosts such as Alibaba OSS.
+func (e *browserEngine) HTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Transport: &browserTransport{engine: e, fallback: http.DefaultTransport, crossOrigin: true}, Timeout: timeout}
 }
 
 func (t *browserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if !strings.EqualFold(req.URL.Host, t.engine.baseURL.Host) || req.URL.Scheme != t.engine.baseURL.Scheme {
+	if !t.crossOrigin && (!strings.EqualFold(req.URL.Host, t.engine.baseURL.Host) || req.URL.Scheme != t.engine.baseURL.Scheme) {
 		return t.fallback.RoundTrip(req)
 	}
 	var body []byte

@@ -7936,6 +7936,16 @@ func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *Q
 	return client
 }
 
+// BrowserHTTPClient returns an HTTP client that runs requests inside headless
+// Chromium (nil when the browser engine is disabled). Used for uploads to the
+// upstream object storage.
+func (c *QwenClient) BrowserHTTPClient() *http.Client {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	return c.engine.HTTPClient(10 * time.Minute)
+}
+
 // Close releases the headless browser, if any.
 func (c *QwenClient) Close() {
 	if c != nil && c.engine != nil {
@@ -8023,7 +8033,7 @@ func (c *QwenClient) CreateChat(ctx context.Context, token, model, chatType stri
 		chatType = "t2t"
 	}
 	ts := time.Now().Unix()
-	body := map[string]any{"title": fmt.Sprintf("api_%d", ts), "models": []string{model}, "chat_mode": "normal", "chat_type": normalizeUpstreamChatType(chatType), "timestamp": ts}
+	body := map[string]any{"title": randomChatTitle(), "models": []string{model}, "chat_mode": "normal", "chat_type": normalizeUpstreamChatType(chatType), "timestamp": ts}
 	logInfo(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(token))
 	status, text, err := c.requestJSON(ctx, http.MethodPost, "/api/v2/chats/new", token, body, 30*time.Second)
 	if err != nil {

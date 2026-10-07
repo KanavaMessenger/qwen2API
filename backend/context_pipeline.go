@@ -970,23 +970,42 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		return nil, fmt.Errorf("getstsToken missing required fields: %s", truncate(text, 200))
 	}
 
-	clientOptions := []oss.ClientOption{
-		oss.SecurityToken(securityToken),
+	putObject := func(httpClient *http.Client) error {
+		clientOptions := []oss.ClientOption{
+			oss.SecurityToken(securityToken),
+		}
+		if region != "" {
+			clientOptions = append(clientOptions, oss.Region(region))
+		}
+		clientOptions = append(clientOptions, oss.AuthVersion(oss.AuthV4))
+		if httpClient != nil {
+			// Cross-origin fetch only exposes CORS-safelisted response headers,
+			// so the CRC64 response header needed for the client check is absent.
+			clientOptions = append(clientOptions, oss.HTTPClient(httpClient), oss.EnableCRC(false))
+		}
+		ossClient, err := oss.New("https://"+endpoint, accessKeyID, accessKeySecret, clientOptions...)
+		if err != nil {
+			return err
+		}
+		bucket, err := ossClient.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.PutObject(filePathRemote, bytes.NewReader(raw), oss.ContentType(contentType))
 	}
-	if region != "" {
-		clientOptions = append(clientOptions, oss.Region(region))
+	// Upload from inside headless Chromium like the real web client; fall back
+	// to a direct upload if the browser path fails (e.g. CORS/signing quirks).
+	var putErr error
+	if browserClient := app.client.BrowserHTTPClient(); browserClient != nil {
+		if putErr = putObject(browserClient); putErr != nil {
+			app.logWarn(ctx, "浏览器上传 OSS 失败，回退直连上传", "error", putErr)
+			putErr = putObject(nil)
+		}
+	} else {
+		putErr = putObject(nil)
 	}
-	clientOptions = append(clientOptions, oss.AuthVersion(oss.AuthV4))
-	ossClient, err := oss.New("https://"+endpoint, accessKeyID, accessKeySecret, clientOptions...)
-	if err != nil {
-		return nil, err
-	}
-	bucket, err := ossClient.Bucket(bucketName)
-	if err != nil {
-		return nil, err
-	}
-	if err := bucket.PutObject(filePathRemote, bytes.NewReader(raw), oss.ContentType(contentType)); err != nil {
-		return nil, err
+	if putErr != nil {
+		return nil, putErr
 	}
 
 	status, text, err = app.client.requestJSON(ctx, http.MethodPost, "/api/v2/files/parse", acc.Token, map[string]any{"file_id": fileID}, 20*time.Second)
