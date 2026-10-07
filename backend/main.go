@@ -2376,7 +2376,7 @@ func (app *App) updateKeepAliveSettings(body map[string]any) error {
 	if _, ok := body["keepalive_interval"]; ok && !locked["keepalive_interval"] {
 		interval := intValue(body, "keepalive_interval", keepAliveDefaultInterval)
 		if interval < keepAliveMinInterval || interval > keepAliveMaxInterval {
-			return fmt.Errorf("保活间隔必须在 %d - %d 秒之间", keepAliveMinInterval, keepAliveMaxInterval)
+			return fmt.Errorf("keepalive interval must be between %d and %d seconds", keepAliveMinInterval, keepAliveMaxInterval)
 		}
 		data["keepalive_interval"] = interval
 	}
@@ -4582,7 +4582,7 @@ func isTransientUpstreamErrorMessage(lower string) bool {
 	return false
 }
 
-const upstreamTemporaryClientMessage = "上游 Qwen 请求被网络超时、连接中断或 WAF 风控拦截；网关已按当前策略重试/切换账号但仍失败。请稍后重试，或在管理页刷新/复验账号后再试。"
+const upstreamTemporaryClientMessage = "The upstream Qwen request was blocked by a network timeout, a dropped connection or the WAF anti-bot check; the gateway retried / switched accounts according to the current policy but still failed. Retry later, or refresh/re-verify the accounts on the admin page and try again."
 
 func sanitizeClientErrorDetail(detail any) any {
 	switch v := detail.(type) {
@@ -6527,7 +6527,7 @@ func (app *App) adminActivateAccount(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	updated, ok, err := app.activateQwenAccount(ctx, *target)
 	if err != nil || !ok {
-		msg := "未能找到激活链接或获取Token"
+		msg := "Activation link or token could not be found"
 		if err != nil {
 			msg = err.Error()
 		}
@@ -6669,10 +6669,10 @@ func (app *App) adminGetKeys(w http.ResponseWriter, r *http.Request) {
 	for key := range app.apiKeys {
 		keys = append(keys, key)
 		source := "managed"
-		label := "面板创建 Key"
+		label := "Created in panel"
 		if app.envAPIKeys[key] {
 			source = "env"
-			label = "环境变量注入 Key"
+			label = "Injected from environment"
 		}
 		items = append(items, map[string]any{"key": key, "source": source, "label": label})
 	}

@@ -218,7 +218,7 @@ export default function TokensPage() {
                   <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                     <span>{t("tokens.maskedNote")}</span>
                     <span className={`rounded-full border px-2 py-0.5 font-bold ${item.source === "env" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "bg-muted text-muted-foreground"}`}>
-                      {item.label || (item.source === "env" ? t("tokens.labelEnv") : t("tokens.labelManaged"))}
+                      {item.source === "env" ? t("tokens.labelEnv") : t("tokens.labelManaged")}
                     </span>
                   </div>
                 </div>
