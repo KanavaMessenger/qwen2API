@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -134,6 +135,7 @@ func main() {
 		logger.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
 	}
+	app.client.Close()
 	logger.Info("qwen2API Go backend stopped")
 }
 
@@ -175,6 +177,9 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 func (app *App) StartBackground(ctx context.Context) {
 	if app == nil {
 		return
+	}
+	if app.client != nil && app.client.engine != nil {
+		go app.client.engine.Prewarm()
 	}
 	app.chatPool.Start(ctx)
 	if app.keepalive != nil {
@@ -1771,6 +1776,11 @@ type Settings struct {
 	Workers                                int
 	AdminKey                               string
 	BrowserPoolSize                        int
+	UpstreamEngine                         string
+	BrowserPath                            string
+	BrowserProxy                           string
+	BrowserWarmupMS                        int
+	BrowserHeadless                        bool
 	MaxInflightPerAccount                  int
 	BrowserStreamTimeoutSeconds            int
 	UpstreamStreamHeaderTimeoutSeconds     int
@@ -1832,6 +1842,11 @@ func LoadSettings() Settings {
 		Workers:                                envInt("WORKERS", 1),
 		AdminKey:                               envString("ADMIN_KEY", ""),
 		BrowserPoolSize:                        envInt("BROWSER_POOL_SIZE", 1),
+		UpstreamEngine:                         normalizeUpstreamEngine(envString("QWEN_ENGINE", engineBrowser)),
+		BrowserPath:                            envString("BROWSER_PATH", ""),
+		BrowserProxy:                           envString("BROWSER_PROXY", ""),
+		BrowserWarmupMS:                        envInt("BROWSER_WARMUP_MS", 2000),
+		BrowserHeadless:                        envBool("BROWSER_HEADLESS", true),
 		MaxInflightPerAccount:                  envIntAlias("MAX_INFLIGHT_PER_ACCOUNT", "MAX_INFLIGHT", 2),
 		BrowserStreamTimeoutSeconds:            envInt("BROWSER_STREAM_TIMEOUT_SECONDS", 1800),
 		UpstreamStreamHeaderTimeoutSeconds:     envInt("UPSTREAM_STREAM_HEADER_TIMEOUT_SECONDS", 120),
@@ -6365,7 +6380,7 @@ func (app *App) adminStatus(w http.ResponseWriter, r *http.Request) {
 		"chat_id_pool":       app.chatPool.Status(),
 		"runtime":            map[string]any{"mode": "go", "goroutines_note": "not exposed"},
 		"request_runtime":    map[string]any{"mode": "direct_http", "browser_required_for_requests": false, "description": "普通请求直连 HTTP，不经过浏览器"},
-		"browser_automation": map[string]any{"mode": "playwright", "description": "Go 后端通过 Playwright 浏览器自动化支持邮箱激活"},
+		"browser_automation": map[string]any{"mode": "playwright", "description": "Go 后端通过 Playwright 浏览器自动化支持邮箱激活", "upstream_engine": app.settings.UpstreamEngine},
 	})
 }
 
@@ -6408,7 +6423,7 @@ func (app *App) adminListAccounts(w http.ResponseWriter, r *http.Request) {
 			"last_error": acc.LastError, "last_request_started": acc.LastRequestStarted, "last_request_finished": acc.LastRequestFinished,
 			"consecutive_failures": acc.ConsecutiveFailures, "rate_limit_strikes": acc.RateLimitStrikes,
 			"valid": acc.Valid, "inflight": acc.Inflight, "rate_limited_until": acc.RateLimitedUntil,
-			"rate_limits": cloneRateLimits(acc.RateLimits),
+			"rate_limits": cloneRateLimits(acc.RateLimits), "token_expires_at": jwtExpiryUnix(acc.Token),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
@@ -6445,7 +6460,15 @@ func (app *App) adminAddAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "email": acc.Email})
+	resp := map[string]any{"ok": true, "email": acc.Email}
+	if exp := jwtExpiryUnix(token); exp > 0 {
+		resp["token_expires_at"] = exp
+		if ttl := time.Until(time.Unix(exp, 0)); ttl < time.Hour {
+			app.logWarn(r.Context(), "账号 Token 为短期令牌，即将过期", "account", acc.Email, "expires_in_seconds", int(ttl.Seconds()))
+			resp["warning"] = fmt.Sprintf("token expires in %d minutes; short-lived access tokens must be replaced after expiry", int(ttl.Minutes()))
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (app *App) adminVerifyAll(w http.ResponseWriter, r *http.Request) {
@@ -7819,9 +7842,12 @@ func latestHumanLineLen(prompt string) int {
 }
 
 // ---- migrated from qwen.go ----
-const qwenBaseURL = "https://chat.qwen.ai"
+// qwenBaseURL can be overridden (QWEN_BASE_URL) to point the client at a mock
+// upstream in tests.
+var qwenBaseURL = strings.TrimRight(envString("QWEN_BASE_URL", "https://chat.qwen.ai"), "/")
 
 type QwenClient struct {
+	engine   *browserEngine
 	pool     *AccountPool
 	settings Settings
 	logger   *slog.Logger
@@ -7874,19 +7900,46 @@ type TokenVerifyResult struct {
 	Error      string
 }
 
+func normalizeUpstreamEngine(value string) string {
+	if normalizeLower(value) == engineHTTP {
+		return engineHTTP
+	}
+	return engineBrowser
+}
+
 func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *QwenClient {
-	return &QwenClient{
-		pool: pool, settings: settings, logger: logger,
-		http: &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment, MaxIdleConns: 100, MaxIdleConnsPerHost: 20,
-				IdleConnTimeout:       30 * time.Second,
-				ResponseHeaderTimeout: streamTimeoutDuration(settings.UpstreamStreamHeaderTimeoutSeconds),
-				ForceAttemptHTTP2:     true,
-			},
-			Timeout: 5 * time.Minute,
-		},
-		deleted: map[string]bool{},
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment, MaxIdleConns: 100, MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: streamTimeoutDuration(settings.UpstreamStreamHeaderTimeoutSeconds),
+		ForceAttemptHTTP2:     true,
+	}
+	client := &QwenClient{pool: pool, settings: settings, logger: logger, deleted: map[string]bool{}}
+	client.http = &http.Client{Transport: transport, Timeout: 5 * time.Minute}
+	if settings.UpstreamEngine == engineBrowser {
+		engine, err := newBrowserEngine(browserEngineConfig{
+			BaseURL:       qwenBaseURL,
+			ExecPath:      settings.BrowserPath,
+			PoolSize:      settings.BrowserPoolSize,
+			HeaderTimeout: streamTimeoutDuration(settings.UpstreamStreamHeaderTimeoutSeconds),
+			WarmupDelay:   time.Duration(settings.BrowserWarmupMS) * time.Millisecond,
+			Proxy:         settings.BrowserProxy,
+			Headless:      settings.BrowserHeadless,
+		}, logger)
+		if err != nil {
+			logger.Error("headless chromium engine unavailable, falling back to plain HTTP", "error", err)
+		} else {
+			client.engine = engine
+			client.http.Transport = &browserTransport{engine: engine, fallback: transport}
+		}
+	}
+	return client
+}
+
+// Close releases the headless browser, if any.
+func (c *QwenClient) Close() {
+	if c != nil && c.engine != nil {
+		c.engine.Close()
 	}
 }
 
@@ -8151,6 +8204,10 @@ func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, paylo
 					if events == 0 {
 						if upstreamError := upstream.ExtractUpstreamError(rawTail); upstreamError != "" {
 							return errors.New(upstreamError)
+						}
+						if isWAFChallenge(rawTail) {
+							logWarn(c.logger, ctx, "上游返回 WAF 验证码挑战", "chat_id", chatID, "engine", c.settings.UpstreamEngine)
+							return errWAFChallenge
 						}
 						logWarn(c.logger, ctx, "上游 SSE 未解析到有效 delta", "chat_id", chatID, "stream_bytes", totalBytes, "raw_tail", truncate(rawTail, 500))
 					}
@@ -9073,4 +9130,25 @@ func truncate(text string, limit int) string {
 
 func trim(text string, limit int) string {
 	return truncate(text, limit)
+}
+
+// jwtExpiryUnix returns the exp claim of a JWT (unix seconds), or 0 when the
+// token is not a JWT or has no exp. The signature is not verified: this is
+// informational only.
+func jwtExpiryUnix(token string) int64 {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return 0
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		Exp float64 `json:"exp"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return 0
+	}
+	return int64(claims.Exp)
 }
