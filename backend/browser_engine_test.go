@@ -427,3 +427,19 @@ func TestBrowserEngineCrossOriginBinaryUpload(t *testing.T) {
 		}
 	}
 }
+
+func TestJWTDiagnostics(t *testing.T) {
+	// payload {"type":"access_token","exp":1,"iat":0}
+	expired := "eyJhbGciOiJIUzI1NiJ9.eyJ0eXBlIjoiYWNjZXNzX3Rva2VuIiwiZXhwIjoxLCJpYXQiOjB9.sig"
+	if d := jwtDiagnostics(expired); !strings.Contains(d, "type=access_token") || !strings.Contains(d, "expired") {
+		t.Fatalf("diag = %q", d)
+	}
+	// payload {"exp":4102444800} (no type)
+	notype := "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.sig"
+	if d := jwtDiagnostics(notype); !strings.Contains(d, "type=(none)") || !strings.Contains(d, "expires in") {
+		t.Fatalf("diag = %q", d)
+	}
+	if jwtDiagnostics("abc") != "token is not a JWT" {
+		t.Fatal("non-JWT must be reported")
+	}
+}

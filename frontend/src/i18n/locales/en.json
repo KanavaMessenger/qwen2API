@@ -221,7 +221,8 @@
     "edit": "Edit",
     "verify": "Refresh / verify",
     "delete": "Delete",
-    "envRemoveHint": "Environment accounts must be removed from the environment variables"
+    "envRemoveHint": "Environment accounts must be removed from the environment variables",
+    "rejectedWithDetail": "{{error}} [{{code}}] {{detail}}"
   },
   "tokens": {
     "refreshFailed": "Refresh failed, check the session key",

@@ -6453,7 +6453,11 @@ func (app *App) adminAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	verify := app.client.VerifyTokenDetail(r.Context(), token)
 	if !verify.Valid {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Invalid token (verification failed, make sure the token is valid)", "status_code": verify.StatusCode, "detail": verify.Error})
+		detail := verify.Error
+		if diag := jwtDiagnostics(token); diag != "" {
+			detail = strings.TrimSpace(detail + " | " + diag)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Invalid token (verification failed, make sure the token is valid)", "status_code": verify.StatusCode, "detail": detail})
 		return
 	}
 	if err := app.accounts.Add(acc); err != nil {
@@ -9140,6 +9144,41 @@ func truncate(text string, limit int) string {
 
 func trim(text string, limit int) string {
 	return truncate(text, limit)
+}
+
+// jwtDiagnostics describes the claims of a JWT (type, expiry) for error
+// messages: a refresh/session token or an expired access token is the usual
+// reason a freshly pasted token is rejected.
+func jwtDiagnostics(token string) string {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return "token is not a JWT"
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return "token payload is not valid base64"
+	}
+	var claims struct {
+		Type string  `json:"type"`
+		Exp  float64 `json:"exp"`
+		Iat  float64 `json:"iat"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return "token payload is not JSON"
+	}
+	out := []string{"jwt type=" + firstNonEmpty(claims.Type, "(none)")}
+	if claims.Exp > 0 {
+		left := time.Until(time.Unix(int64(claims.Exp), 0))
+		if left <= 0 {
+			out = append(out, fmt.Sprintf("expired %d min ago", int(-left.Minutes())))
+		} else {
+			out = append(out, fmt.Sprintf("expires in %s", left.Round(time.Minute)))
+		}
+	}
+	if claims.Type != "" && claims.Type != "access_token" {
+		out = append(out, "not an access_token: paste the access token from localStorage 'token'")
+	}
+	return strings.Join(out, ", ")
 }
 
 // jwtExpiryUnix returns the exp claim of a JWT (unix seconds), or 0 when the

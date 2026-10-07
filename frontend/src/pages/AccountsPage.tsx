@@ -208,6 +208,14 @@ function localizeError(error?: string) {
   return error
 }
 
+// Show the real upstream reason (status_code + detail) instead of collapsing every
+// error that mentions "token" into one generic message.
+function upstreamRejection(data: { error?: string; status_code?: string; detail?: string }, fallback: string) {
+  const error = data.error || fallback
+  if (!data.detail && !data.status_code) return localizeError(data.error) || fallback
+  return i18n.t("accounts.rejectedWithDetail", { error, code: data.status_code || "-", detail: String(data.detail || "").slice(0, 300) })
+}
+
 function getString(value: unknown) {
   return typeof value === "string" ? value.trim() : ""
 }
@@ -489,7 +497,7 @@ export default function AccountsPage() {
           setToken("")
           fetchAccounts()
         } else {
-          toast.error(localizeError(data.error) || t("accounts.injectFailed"), { id, duration: 8000 })
+          toast.error(upstreamRejection(data, t("accounts.injectFailed")), { id, duration: 12000 })
         }
       })
       .catch(err => toast.error(err instanceof Error ? err.message : t("accounts.injectRequestFailed"), { id }))
