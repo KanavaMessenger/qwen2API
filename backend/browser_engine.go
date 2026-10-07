@@ -441,6 +441,8 @@ type browserEngineConfig struct {
 	HeaderTimeout time.Duration
 	WarmupDelay   time.Duration
 	Proxy         string
+	ProxyDial     dialFunc                       // test hook: how the local forwarder dials out
+	ExtraOptions  []chromedp.ExecAllocatorOption // test hook
 	UserAgent     string
 	Headless      bool
 }
@@ -451,13 +453,14 @@ type browserEngine struct {
 	headerTimeout time.Duration
 	logger        *slog.Logger
 
-	mu       sync.Mutex
-	alloc    context.Context
-	cancelFn context.CancelFunc
-	sessions []*browserSession
-	rr       int
-	seq      atomic.Int64
-	closed   bool
+	mu        sync.Mutex
+	alloc     context.Context
+	cancelFn  context.CancelFunc
+	forwarder *proxyForwarder
+	sessions  []*browserSession
+	rr        int
+	seq       atomic.Int64
+	closed    bool
 }
 
 func newBrowserEngine(cfg browserEngineConfig, logger *slog.Logger) (*browserEngine, error) {
@@ -530,8 +533,22 @@ func (e *browserEngine) ensureBrowserLocked() error {
 		chromedp.UserAgent(e.cfg.UserAgent),
 		chromedp.WindowSize(1365, 768),
 	)
-	if e.cfg.Proxy != "" {
+	opts = append(opts, e.cfg.ExtraOptions...)
+	// Never let Chromium discover proxies by itself (that is what fails with
+	// ERR_PROXY_CONNECTION_FAILED); either use the explicit BROWSER_PROXY, or a
+	// local forwarder that dials with Go's proxy rules.
+	switch {
+	case strings.EqualFold(e.cfg.Proxy, "direct"):
+		opts = append(opts, chromedp.Flag("no-proxy-server", true))
+	case e.cfg.Proxy != "":
 		opts = append(opts, chromedp.ProxyServer(e.cfg.Proxy))
+	default:
+		fwd, err := startProxyForwarder(e.logger, e.cfg.ProxyDial)
+		if err != nil {
+			return fmt.Errorf("start proxy forwarder: %w", err)
+		}
+		e.forwarder = fwd
+		opts = append(opts, chromedp.ProxyServer(fwd.URL()))
 	}
 	alloc, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
 	// Root context owns the browser process; per-session contexts derive from
@@ -545,7 +562,8 @@ func (e *browserEngine) ensureBrowserLocked() error {
 	e.alloc = root
 	e.cancelFn = func() { cancelRoot(); cancelAlloc() }
 	if e.logger != nil {
-		e.logger.Info("headless chromium engine starting", "browser", path, "pool_size", e.cfg.PoolSize, "base_url", e.cfg.BaseURL)
+		e.logger.Info("headless chromium engine starting", "browser", path, "pool_size", e.cfg.PoolSize, "base_url", e.cfg.BaseURL,
+			"network", describeBrowserProxy(e.cfg.Proxy, e.baseURL))
 	}
 	return nil
 }
@@ -678,12 +696,16 @@ func (e *browserEngine) Close() {
 	sessions := e.sessions
 	e.sessions = nil
 	cancel := e.cancelFn
+	fwd := e.forwarder
 	e.mu.Unlock()
 	for _, s := range sessions {
 		s.close()
 	}
 	if cancel != nil {
 		cancel()
+	}
+	if fwd != nil {
+		fwd.Close()
 	}
 }
 
