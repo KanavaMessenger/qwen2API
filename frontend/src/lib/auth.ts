@@ -1,3 +1,5 @@
+import i18n from "../i18n"
+
 /**
  * 规范化用户粘贴的管理凭证。
  *
@@ -78,11 +80,11 @@ export async function adminRequestErrorMessage(res: Response): Promise<string> {
   }
 
   if (res.status === 401) {
-    return "未携带会话 Key：请到「系统设置」粘贴 ADMIN_KEY 或 data/api_keys.json 中已有 API Key"
+    return i18n.t("errors.noSessionKey")
   }
   if (res.status === 403) {
-    return "会话 Key 不匹配：请确认粘贴的是当前 data/api_keys.json 中的完整 key，且不要带 Bearer 前缀"
+    return i18n.t("errors.sessionKeyMismatch")
   }
   if (detail) return detail
-  return `请求失败（HTTP ${res.status}）`
+  return i18n.t("errors.requestFailed", { status: res.status })
 }

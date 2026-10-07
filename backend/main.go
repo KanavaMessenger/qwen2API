@@ -6379,8 +6379,8 @@ func (app *App) adminStatus(w http.ResponseWriter, r *http.Request) {
 		"per_account":        perAccount,
 		"chat_id_pool":       app.chatPool.Status(),
 		"runtime":            map[string]any{"mode": "go", "goroutines_note": "not exposed"},
-		"request_runtime":    map[string]any{"mode": "direct_http", "browser_required_for_requests": false, "description": "普通请求直连 HTTP，不经过浏览器"},
-		"browser_automation": map[string]any{"mode": "playwright", "description": "Go 后端通过 Playwright 浏览器自动化支持邮箱激活", "upstream_engine": app.settings.UpstreamEngine},
+		"request_runtime":    app.requestRuntimeStatus(),
+		"browser_automation": map[string]any{"mode": "playwright", "description": "Email activation uses Playwright browser automation."},
 	})
 }
 
@@ -6453,7 +6453,7 @@ func (app *App) adminAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	verify := app.client.VerifyTokenDetail(r.Context(), token)
 	if !verify.Valid {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Invalid token (验证失败，请确认Token有效)", "status_code": verify.StatusCode, "detail": verify.Error})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Invalid token (verification failed, make sure the token is valid)", "status_code": verify.StatusCode, "detail": verify.Error})
 		return
 	}
 	if err := app.accounts.Add(acc); err != nil {
@@ -6518,7 +6518,7 @@ func (app *App) adminActivateAccount(w http.ResponseWriter, r *http.Request) {
 		if verify.Valid {
 			_ = app.accounts.MarkVerification(target.Email, verify)
 			app.logInfo(r.Context(), "账号已激活，现有 token 验证通过", "account", email)
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "账号已激活，现有 token 验证通过"})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Account already active, the existing token is valid"})
 			return
 		}
 		app.logWarn(r.Context(), "账号标记有效但现有 token 验证失败，继续激活流程", "account", email, "status_code", verify.StatusCode, "error", verify.Error)
@@ -6541,7 +6541,7 @@ func (app *App) adminActivateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	app.logInfo(r.Context(), "账号激活成功", "account", email)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "账号激活成功"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Account activated"})
 }
 
 func (app *App) adminVerifyAccount(w http.ResponseWriter, r *http.Request) {
@@ -6566,7 +6566,7 @@ func (app *App) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := app.accounts.Remove(r.PathValue("email")); err != nil {
 		if strings.Contains(err.Error(), "environment account") {
-			writeError(w, http.StatusBadRequest, "环境变量注入账号不能在面板删除，请移除对应环境变量后重启服务")
+			writeError(w, http.StatusBadRequest, "Accounts injected from environment variables cannot be deleted in the panel; remove the variable and restart the service")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -6705,11 +6705,11 @@ func (app *App) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimSpace(body.Key)
 	if mode == "custom" {
 		if key == "" {
-			writeError(w, http.StatusBadRequest, "自定义 Key 不能为空")
+			writeError(w, http.StatusBadRequest, "Custom key must not be empty")
 			return
 		}
 		if strings.ContainsAny(key, " \t\r\n") {
-			writeError(w, http.StatusBadRequest, "自定义 Key 不能包含空白字符")
+			writeError(w, http.StatusBadRequest, "Custom key must not contain whitespace")
 			return
 		}
 	} else {
@@ -6718,7 +6718,7 @@ func (app *App) adminCreateKey(w http.ResponseWriter, r *http.Request) {
 		key = "sk-" + hex.EncodeToString(buf)
 	}
 	if app.apiKeys[key] {
-		writeError(w, http.StatusConflict, "API Key 已存在")
+		writeError(w, http.StatusConflict, "API key already exists")
 		return
 	}
 	app.apiKeys[key] = true
@@ -6733,7 +6733,7 @@ func (app *App) adminDeleteKey(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("key")
 	if app.envAPIKeys[key] {
-		writeError(w, http.StatusBadRequest, "环境变量注入 Key 不能在面板删除，请移除对应环境变量后重启服务")
+		writeError(w, http.StatusBadRequest, "Keys injected from environment variables cannot be deleted in the panel; remove the variable and restart the service")
 		return
 	}
 	delete(app.apiKeys, key)
@@ -9151,4 +9151,20 @@ func jwtExpiryUnix(token string) int64 {
 		return 0
 	}
 	return int64(claims.Exp)
+}
+
+// requestRuntimeStatus describes how upstream requests are executed, for the
+// dashboard.
+func (app *App) requestRuntimeStatus() map[string]any {
+	if app.client != nil && app.client.engine != nil {
+		status := app.client.engine.Status()
+		return map[string]any{
+			"mode":                          "headless_chromium",
+			"browser_required_for_requests": true,
+			"description":                   "Upstream requests run as fetch() inside headless Chromium so the anti-bot WAF scripts execute like in the real web client.",
+			"sessions":                      status["sessions"],
+			"pool_size":                     status["pool_size"],
+		}
+	}
+	return map[string]any{"mode": "direct_http", "browser_required_for_requests": false, "description": "Upstream requests are sent directly over HTTP (QWEN_ENGINE=http). The Alibaba WAF may answer with a captcha challenge."}
 }

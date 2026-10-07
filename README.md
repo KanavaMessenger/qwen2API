@@ -188,6 +188,9 @@ Do not commit real secrets. `.env.example` intentionally contains empty values a
 | `QWEN_API_KEY`, `QWEN_API_KEYS`, `QWEN_API_KEY_N` | Runtime-only downstream API keys injected from env. They are not saved to `data/api_keys.json` and cannot be deleted from WebUI. |
 | `QWEN_ACCOUNT_N` | Runtime-only upstream Qwen account, format `token;optional-email;optional-password`. It is not saved to `data/accounts.json`. |
 | `KEEPALIVE_URL`, `KEEPALIVE_INTERVAL` | Optional background keepalive task. Env values lock the same WebUI settings. |
+| `QWEN_ENGINE` | Upstream engine. `browser` (default) sends every `chat.qwen.ai` request as `fetch()` inside a headless Chromium page so the Alibaba WAF/anti-bot scripts run like in the real web client; a captcha challenge (`x5secdata/punish`) rotates the browser session and retries. `http` uses plain Go `net/http` and usually gets a captcha instead of an answer. |
+| `BROWSER_POOL_SIZE` | Number of warm Chromium sessions (isolated browser contexts). Default `1`. |
+| `BROWSER_PATH`, `BROWSER_PROXY`, `BROWSER_WARMUP_MS`, `BROWSER_HEADLESS` | Optional Chromium binary (auto-detected from `PLAYWRIGHT_BROWSERS_PATH`/`PATH` otherwise), browser proxy (`http://host:port`), wait after loading the upstream page before the first request (default `2000`), and headless toggle (default `true`). |
 | `TOOL_RECOVERY_MAX_ATTEMPTS` | Maximum automatic recovery attempts when an upstream response after a tool result fails to produce the next client tool call. Default `4`, clamped to `1`-`8`. |
 | `HOST_DATA_DIR`, `HOST_LOGS_DIR` | Host paths mounted into Docker as `/app/data` and `/app/logs`. Defaults are `./data` and `./logs`. |
 | `DATA_DIR`, `LOGS_DIR` | Local non-Docker path overrides. Leave empty to use the current project directory. |
@@ -237,13 +240,18 @@ cd frontend
 npm run build
 ```
 
-### 5. Development Rules
+### 5. WebUI Localisation (i18n)
+
+The WebUI uses [i18next](https://www.i18next.com/) / `react-i18next`. All UI strings live in `frontend/src/i18n/locales/en.json` (English is the only shipped language for now). To add a language, create `locales/<code>.json` with the same keys, register it in `frontend/src/i18n/index.ts` (`resources` and `SUPPORTED_LANGUAGES`), and the choice is remembered in `localStorage` (`qwen2api_lang`).
+
+### 6. Development Rules
 
 - Keep the Go backend as the `v2.0` runtime source of truth.
 - Keep Docker data paths container-internal as `/app/data` and `/app/logs`.
 - Control host paths through compose volume mappings instead of hard-coded workspace paths.
 - Do not commit `data/`, `logs/`, `.env`, real tokens, cookies, passwords, or downstream API keys.
 - Update README and `.env.example` when adding user-visible configuration.
+- Add every new WebUI string to `frontend/src/i18n/locales/en.json` instead of hard-coding text in components.
 
 ## 五、参与贡献 / Contribution
 

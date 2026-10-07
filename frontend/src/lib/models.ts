@@ -1,3 +1,4 @@
+import i18n from "../i18n"
 import { API_BASE } from "./api"
 import { getAuthHeader } from "./auth"
 
@@ -40,15 +41,15 @@ export const FALLBACK_VIDEO_MODELS: ModelOption[] = [
   { id: "qwen3.6-plus-video", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "video", display_name: "qwen3.6-plus video", capabilities: { video_gen: true } },
 ]
 
-export const CAPABILITY_LABELS: Array<{ key: keyof ModelCapability; label: string }> = [
-  { key: "thinking", label: "思考" },
-  { key: "search", label: "搜索" },
-  { key: "vision", label: "视觉" },
-  { key: "deep_research", label: "研究" },
-  { key: "image_gen", label: "图片" },
-  { key: "video_gen", label: "视频" },
-  { key: "web_dev", label: "建站" },
-  { key: "slides", label: "PPT" },
+export const CAPABILITY_LABELS: Array<{ key: keyof ModelCapability; labelKey: string }> = [
+  { key: "thinking", labelKey: "models.capability.thinking" },
+  { key: "search", labelKey: "models.capability.search" },
+  { key: "vision", labelKey: "models.capability.vision" },
+  { key: "deep_research", labelKey: "models.capability.deep_research" },
+  { key: "image_gen", labelKey: "models.capability.image_gen" },
+  { key: "video_gen", labelKey: "models.capability.video_gen" },
+  { key: "web_dev", labelKey: "models.capability.web_dev" },
+  { key: "slides", labelKey: "models.capability.slides" },
 ]
 
 const MODEL_MODE_SUFFIX_RE = /-(thinking|search|deep-research|deep_research|image|video|webdev|web-dev|slides|t2i|t2v)$/i
@@ -133,7 +134,7 @@ export function isThinkingVariant(modelId: string): boolean {
 
 export function capabilityBadges(option?: ModelOption): string[] {
   if (!option?.capabilities) return []
-  return CAPABILITY_LABELS.filter(item => option.capabilities?.[item.key]).map(item => item.label)
+  return CAPABILITY_LABELS.filter(item => option.capabilities?.[item.key]).map(item => i18n.t(item.labelKey))
 }
 
 export function filterTextTestModels(options: ModelOption[]): ModelOption[] {
@@ -212,14 +213,14 @@ export function groupModelOptions(options: ModelOption[]): ModelGroup[] {
 
 export function formatModeLabel(mode?: string): string {
   switch (mode) {
-    case "thinking": return "思考"
-    case "search": return "搜索"
-    case "deep_research": return "研究"
-    case "image": return "图片"
-    case "video": return "视频"
-    case "webdev": return "建站"
-    case "slides": return "PPT"
-    default: return "对话"
+    case "thinking": return i18n.t("models.mode.thinking")
+    case "search": return i18n.t("models.mode.search")
+    case "deep_research": return i18n.t("models.mode.deep_research")
+    case "image": return i18n.t("models.mode.image")
+    case "video": return i18n.t("models.mode.video")
+    case "webdev": return i18n.t("models.mode.webdev")
+    case "slides": return i18n.t("models.mode.slides")
+    default: return i18n.t("models.mode.chat")
   }
 }
 

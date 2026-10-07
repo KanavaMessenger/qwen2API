@@ -11,18 +11,20 @@ import {
   X,
 } from "lucide-react"
 import { useState } from "react"
+import { useTranslation } from "react-i18next"
 
 const navItems = [
-  { name: "运行状态", path: "/", icon: LayoutDashboard },
-  { name: "账号管理", path: "/accounts", icon: Activity },
-  { name: "API Key", path: "/tokens", icon: Key },
-  { name: "接口测试", path: "/test", icon: MessageSquare },
-  { name: "图片生成", path: "/images", icon: Image },
-  { name: "视频生成", path: "/videos", icon: Video },
-  { name: "系统设置", path: "/settings", icon: Settings },
+  { nameKey: "nav.status", path: "/", icon: LayoutDashboard },
+  { nameKey: "nav.accounts", path: "/accounts", icon: Activity },
+  { nameKey: "nav.apiKeys", path: "/tokens", icon: Key },
+  { nameKey: "nav.apiTest", path: "/test", icon: MessageSquare },
+  { nameKey: "nav.images", path: "/images", icon: Image },
+  { nameKey: "nav.videos", path: "/videos", icon: Video },
+  { nameKey: "nav.settings", path: "/settings", icon: Settings },
 ]
 
 export default function AdminLayout() {
+  const { t } = useTranslation()
   const loc = useLocation()
   const [mobileOpen, setMobileOpen] = useState(false)
   const activeItem = navItems.find(item => item.path === loc.pathname) || navItems[0]
@@ -52,7 +54,7 @@ export default function AdminLayout() {
             type="button"
             className="rounded-full border border-white/70 bg-card/70 p-2 text-muted-foreground shadow-sm md:hidden"
             onClick={() => setMobileOpen(false)}
-            aria-label="关闭导航"
+            aria-label={t("layout.closeNav")}
           >
             <X className="size-5" />
           </button>
@@ -79,7 +81,7 @@ export default function AdminLayout() {
                 >
                   <item.icon className="size-4" />
                 </span>
-                <span className="truncate">{item.name}</span>
+                <span className="truncate">{t(item.nameKey)}</span>
               </Link>
             )
           })}
@@ -89,10 +91,10 @@ export default function AdminLayout() {
           <div className="rounded-[24px] border border-white/70 bg-muted/22 p-4 shadow-sm">
             <div className="flex items-center gap-2 text-xs font-black text-muted-foreground">
               <span className="size-2 rounded-full bg-accent" />
-              Go 后端运行
+              {t("layout.backendRunning")}
             </div>
             <div className="mt-2 text-sm leading-6 text-muted-foreground">
-              保持原版管理入口，前端只展示必要页面。
+              {t("layout.sidebarNote")}
             </div>
           </div>
         </div>
@@ -105,13 +107,13 @@ export default function AdminLayout() {
               type="button"
               className="rounded-full border border-white/70 bg-card/70 p-2 text-muted-foreground shadow-sm md:hidden"
               onClick={() => setMobileOpen(true)}
-              aria-label="打开导航"
+              aria-label={t("layout.openNav")}
             >
               <Menu className="size-5" />
             </button>
             <div className="min-w-0">
               <div className="text-[11px] font-black uppercase tracking-[0.24em] text-muted-foreground">Admin Console</div>
-              <h1 className="truncate text-xl font-black tracking-tight md:text-2xl">{activeItem.name}</h1>
+              <h1 className="truncate text-xl font-black tracking-tight md:text-2xl">{t(activeItem.nameKey)}</h1>
             </div>
           </div>
           <div className="hidden items-center gap-2 lg:flex">

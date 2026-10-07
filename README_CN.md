@@ -188,6 +188,9 @@ flowchart LR
 | `QWEN_API_KEY`、`QWEN_API_KEYS`、`QWEN_API_KEY_N` | 环境变量注入的下游 API Key，仅运行时存在，不写入 `data/api_keys.json`，不能从 WebUI 删除 |
 | `QWEN_ACCOUNT_N` | 环境变量注入的上游账号，格式为 `token;optional-email;optional-password`，不写入 `data/accounts.json` |
 | `KEEPALIVE_URL`、`KEEPALIVE_INTERVAL` | 可选后台保活任务；环境变量存在时会锁定 WebUI 中对应配置 |
+| `QWEN_ENGINE` | 上游请求引擎。`browser`（默认）把所有 `chat.qwen.ai` 请求放到 headless Chromium 页面里以 `fetch()` 执行，使阿里 WAF 反爬脚本与真实网页端一致；遇到验证码挑战（`x5secdata/punish`）会轮换浏览器会话并重试。`http` 使用普通 Go `net/http`，通常只会拿到验证码而不是回答 |
+| `BROWSER_POOL_SIZE` | 预热的 Chromium 会话（独立浏览器上下文）数量，默认 `1` |
+| `BROWSER_PATH`、`BROWSER_PROXY`、`BROWSER_WARMUP_MS`、`BROWSER_HEADLESS` | 可选：Chromium 路径（默认从 `PLAYWRIGHT_BROWSERS_PATH`/`PATH` 自动查找）、浏览器代理（`http://host:port`）、加载上游页面后首次请求前的等待时间（默认 `2000`）、是否 headless（默认 `true`） |
 | `TOOL_RECOVERY_MAX_ATTEMPTS` | 工具结果之后上游没有产出下一次客户端工具调用时的自动恢复尝试次数；默认 `4`，限制在 `1`-`8` |
 | `HOST_DATA_DIR`、`HOST_LOGS_DIR` | Docker 宿主机挂载路径，默认 `./data` 和 `./logs` |
 | `DATA_DIR`、`LOGS_DIR` | 本地非 Docker 路径覆盖；留空时使用当前项目目录 |
